@@ -950,12 +950,19 @@ input[dir="auto"], textarea[dir="auto"]{ unicode-bidi: plaintext; }
     box-shadow: 0 0 0 3px var(--yellow), 0 0 0 7px rgba(255,210,31,.30),
                 0 6px 18px rgba(0,0,0,.25) !important;
   }
-  #aitutormsgs, .aichatmsgs, .aichatmsg, .aimsgin, .ailine, .ailist, .aihead,
-  #aisearchres, .aimtitle, .aim, .aimask, .aimload, .aimoff {
+  /* Keep the chat/search columns and bullets LTR, but let each message line
+     choose its bidi base from the text. English medical terms are isolated LTR. */
+  #aitutormsgs, .aichatmsgs, .aichatmsg, .aimsgin, .ailist, #aisearchres {
     direction: ltr !important; text-align: left !important; unicode-bidi: normal !important;
   }
+  #aitutormsgs .ailine, .aichatmsg .ailine, .aimsgin .ailine,
+  .aimsgin .ailist li, .aimsgin .aihead,
+  #aisearchres .aimtitle, #aisearchres .aim, #aisearchres .aimask,
+  #aisearchres .aimload, #aisearchres .aimoff {
+    text-align: left !important; unicode-bidi: plaintext !important;
+  }
   #aitutorin, .aichatinput input, #searchinput, .wta {
-    direction: ltr !important; text-align: left !important;
+    text-align: left !important; unicode-bidi: plaintext !important;
   }
   @media (max-width: 540px) {
     #page { padding-left: 76px !important; padding-right: 66px !important; }
@@ -5449,11 +5456,29 @@ const TOPIMG = "";   /* this PDF carries no image */
   /* =======================================================================
      3 · FUN FORMATTING (points, bold, emoji — never a condensed paragraph)
      ======================================================================= */
+  /* Keep English/number runs as isolated LTR islands inside Arabic paragraphs.
+     The containing line can follow its first strong character without reversing
+     medical terms, abbreviations, formulas, or their punctuation. */
+  function isolateLtrRuns(html) {
+    return String(html).split(/(<[^>]*>)/g).map(function (part) {
+      if (part && part.charAt(0) === "<") return part;
+      const text = part.replace(/&(amp|lt|gt);/g, function (entity) {
+        return entity === "&amp;" ? "&" : (entity === "&lt;" ? "<" : ">");
+      });
+      return text.split(/([A-Za-z0-9][A-Za-z0-9\t .,;:!?&'’()\/%:+\-–—=^×←→↔<>≤≥]*)/g)
+        .map(function (piece) {
+          if (/[A-Za-z0-9]/.test(piece)) return "<bdi dir='ltr'>" + esc(piece) + "</bdi>";
+          return esc(piece);
+        }).join("");
+    }).join("");
+  }
+  function bidiText(text) { return isolateLtrRuns(esc(String(text == null ? "" : text))); }
   function aiInline(s) {
-    return esc(s)
+    const formatted = esc(s)
       .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
       .replace(/`([^`]+)`/g, "<code>$1</code>")
       .replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s.,!?;:)])/g, "$1<i>$2</i>");
+    return isolateLtrRuns(formatted);
   }
   function aiMd(src) {
     const lines = String(src).split(/\n/);
@@ -5463,19 +5488,19 @@ const TOPIMG = "";   /* this PDF carries no image */
       if (/^VERDICT\s*:/i.test(t)) continue;
       if (/^(-|\*|•)\s+/.test(t)) {
         if (!inList) { html += "<ul class='ailist'>"; inList = true; }
-        html += "<li dir='ltr'>" + aiInline(t.replace(/^(-|\*|•)\s+/, "")) + "</li>";
+        html += "<li dir='ltr'><span class='ailine' dir='auto'>" + aiInline(t.replace(/^(-|\*|•)\s+/, "")) + "</span></li>";
       } else if (/^#{1,5}\s+/.test(t)) {
         if (inList) { html += "</ul>"; inList = false; }
-        html += "<div class='aihead' dir='ltr'>" + aiInline(t.replace(/^#{1,5}\s+/, "")) + "</div>";
+        html += "<div class='aihead' dir='auto'>" + aiInline(t.replace(/^#{1,5}\s+/, "")) + "</div>";
       } else if (t === "") {
         if (inList) { html += "</ul>"; inList = false; }
       } else {
         if (inList) { html += "</ul>"; inList = false; }
-        html += "<p class='ailine' dir='ltr'>" + aiInline(t) + "</p>";
+        html += "<p class='ailine' dir='auto'>" + aiInline(t) + "</p>";
       }
     }
     if (inList) html += "</ul>";
-    return html || "<p class='ailine'>…</p>";
+    return html || "<p class='ailine' dir='auto'>…</p>";
   }
   /* wrap every word in a bubble so one click = highlight (like the rest of the page) */
   function aiWrapWords(root) {
@@ -5535,7 +5560,7 @@ const TOPIMG = "";   /* this PDF carries no image */
         "<div class='aichatmsgs' aria-live='polite'></div>" +
         "<div class='aichiprow'></div>" +
         "<div class='aichatinput'>" +
-          "<input type='text' autocomplete='off' spellcheck='false' dir='ltr' " +
+          "<input type='text' autocomplete='off' spellcheck='false' dir='auto' " +
           "placeholder='ask, or just say what you think…'>" +
           "<button type='button' class='aisend' title='send'>➤</button>" +
         "</div>";
@@ -5647,8 +5672,8 @@ const TOPIMG = "";   /* this PDF carries no image */
     addUser: function (card, text) {
       const c = card._d.aichat;
       const b = el("div", "aichatmsg user");
-      b.innerHTML = "<p class='ailine' dir='ltr'></p>";
-      q1(".ailine", b).textContent = text;
+      b.innerHTML = "<p class='ailine' dir='auto'></p>";
+      q1(".ailine", b).innerHTML = bidiText(text);
       c.msgs.appendChild(b);
       AIChat.scroll(card);
       return b;
@@ -6016,8 +6041,8 @@ const TOPIMG = "";   /* this PDF carries no image */
       if (AITutor.busy) return;
       AITutor.busy = true;
       const u = el("div", "aichatmsg user");
-      u.innerHTML = "<p class='ailine' dir='ltr'></p>";
-      q1(".ailine", u).textContent = text;
+      u.innerHTML = "<p class='ailine' dir='auto'></p>";
+      q1(".ailine", u).innerHTML = bidiText(text);
       AITutor.msgs.appendChild(u);
       AITutor.scroll();
       const b = el("div", "aichatmsg ai");
@@ -6139,7 +6164,7 @@ const TOPIMG = "";   /* this PDF carries no image */
       AISearch._retried = false;
       AISearch.lastQ = query;
       AISearch.box.innerHTML =
-        "<div class='aimload' dir='ltr'><span class='aidots'><i></i><i></i><i></i></span> the AI is reading your mind… بيقرأ بالك…</div>";
+        "<div class='aimload' dir='auto'><span class='aidots'><i></i><i></i><i></i></span> the AI is reading your mind… بيقرأ بالك…</div>";
       try {
         const raw = await aiAsk(
           [{ role: "system", content: AISearch.system() },
@@ -6246,7 +6271,7 @@ const TOPIMG = "";   /* this PDF carries no image */
       const hits = AISearch.match(terms);
       const parts = [];
       if (terms.length) {
-        parts.push("<div class='aimtitle' dir='ltr'>" +
+        parts.push("<div class='aimtitle' dir='auto'>" +
           (ar ? "🤖 لقيتلك الأسئلة القريبة من قصدك" : "🤖 Related questions found") +
           "</div>");
       }
@@ -6264,20 +6289,20 @@ const TOPIMG = "";   /* this PDF carries no image */
           if (snip.length > 260) snip = snip.slice(0, 260) + "...";
           const st = (typeof itemState === "function") ? itemState(q) : null;
           parts.push(
-            "<button type='button' class='sres aisres' data-key=\"" + esc(q.key) +
+            "<button type='button' class='sres aisres' dir='auto' data-key=\"" + esc(q.key) +
             "\" data-words=\"" + esc(terms.join("|")) + "\">" +
-            "<span class='sh'><span class='n'>" + esc(q.n) + "</span> the question" +
+            "<span class='sh' dir='auto'><span class='n'>" + esc(q.n) + "</span> the question" +
             "<span class='sec'>" + esc(q.sec) + "</span></span>" +
-            "<span class='sx'>" + snip + "</span>" +
+            "<span class='sx' dir='auto'>" + isolateLtrRuns(snip) + "</span>" +
             (st === "bad" ? "<span class='sn'>wrong answer - in your list</span>" : "") +
             "</button>");
         });
       } else if (terms.length) {
-        parts.push("<div class='aim none' dir='ltr'>🤖 " + (ar ? "مفيش حاجة في الملف عن كده… بس أقدر أشرحهالك" : "nothing in this quiz about it… but I can still teach you") + "</div>" +
-          "<button type='button' class='aimask' dir='ltr' data-q=\"" + esc(query).replace(/"/g, "&quot;") + "\">" + (ar ? "🤖 علّمني: \"" : "🤖 teach me: \"") +
-          esc(query) + "\"</button>");
+        parts.push("<div class='aim none' dir='auto'>🤖 " + (ar ? "مفيش حاجة في الملف عن كده… بس أقدر أشرحهالك" : "nothing in this quiz about it… but I can still teach you") + "</div>" +
+          "<button type='button' class='aimask' dir='auto' data-q=\"" + esc(query).replace(/"/g, "&quot;") + "\">" + (ar ? "🤖 علّمني: \"" : "🤖 teach me: \"") +
+          bidiText(query) + "\"</button>");
       } else {
-        parts.push("<div class='aim none' dir='ltr'>🤖 " + (ar ? "مش فاهم قصدك — جرّب كلمة طبية" : "I could not understand the search — try a medical word") + "</div>");
+        parts.push("<div class='aim none' dir='auto'>🤖 " + (ar ? "مش فاهم قصدك — جرّب كلمة طبية" : "I could not understand the search — try a medical word") + "</div>");
       }
       AISearch.box.innerHTML = parts.join("");
       if (hits.length) {
@@ -7550,7 +7575,7 @@ function writeRow(q, card, d) {
   row.appendChild(line);
 
   const tip = document.createElement("div"); tip.className = "wtip";
-  tip.textContent = "write it in your own words — spelling and short forms are fine, the AI tutor chats with you about it 😉";
+  tip.textContent = "write it in your own words ✍";
   row.appendChild(tip);
 
   const vb = document.createElement("div");
@@ -8126,4 +8151,4 @@ document.getElementById("modelbtn").addEventListener("click", () => {
   setModel(MODEL === "ai" ? "file" : "ai");
 });
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4015e2f6f6dcb4b',t:'MTc5MDI0ODQ5MQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body></html>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4016d7cfa41da31',t:'MTc5MDI0OTExOA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body></html>
