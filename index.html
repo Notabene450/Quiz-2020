@@ -6587,19 +6587,48 @@ const TOPIMG = "";   /* this PDF carries no image */
     /* if ANY provider told us the limit ran out, say so — that's the real reason */
     throw limitErr || lastErr || new Error("no ai provider");
   }
+  /* ---------- the pen's favour: keep the Google amount for the pictures ----------
+     When an answer was WRITTEN with the pen, the correction goes to Groq FIRST (if a
+     Groq key is saved) - Google is then used for the one thing only Google can do here:
+     reading the ink. Anything Groq cannot do (bad key, limit, empty answer) falls back
+     on the usual chain: a wrong verdict is worse than a spent minute of Google. */
+  async function aiAskPrefer(messages, opts) {
+    opts = opts || {};
+    if (!opts.preferGroq) return aiAsk(messages, opts);
+    const k = aiKeys();
+    if (!k.groq) return aiAsk(messages, opts);
+    let err = null;
+    for (let mi = 0; mi < GROQ_MODELS.length; mi++) {
+      for (let a = 0; a < 2; a++) {
+        try {
+          const out = await ooaiOnce(GROQ_URL, GROQ_MODELS[mi], messages, opts, k.groq);
+          opts.routed = "groq";
+          return out;
+        } catch (e) {
+          err = e;
+          if (e && e.aiAbort && opts.cancelled) throw e;
+          const stop = (e && e.aiStop) || "retry";
+          if (stop === "retry" && a + 1 < 2) { await aiSleep(400 + a * 700); continue; }
+          break;                                        /* next Groq model */
+        }
+      }
+    }
+    if (err && aiLooksLimited(err)) opts.routed = "groq-out";
+    return aiAsk(messages, opts);                        /* Google takes it after all */
+  }
 
   /* aiAsk + a deterministic language mirror: if the student wrote Arabic but
      the model answered without a single Arabic word, retry once, harder */
   async function aiAskLang(msgs, opts, arabicIn) {
     const ar = !!arabicIn;
-    let raw = await aiAsk(msgs, opts);
+    let raw = await aiAskPrefer(msgs, opts);
     if (ar && !/[\u0600-\u06FF]/.test(stripVerdict(raw))) {
       try {
         const msgs2 = msgs.slice();
         msgs2[0] = { role: "system", content: String(msgs2[0].content) +
           "\n\nMANDATORY OVERWRITE of your rejected previous style: write EVERY word of the reply in Egyptian Arabic (\u0639\u0627\u0645\u064a\u0629 \u0645\u0635\u0631\u064a\u0629). " +
           "The ONLY English allowed inside it: medical terms, drug names and lab names." };
-        const raw2 = await aiAsk(msgs2, opts);
+        const raw2 = await aiAskPrefer(msgs2, opts);
         if (raw2) raw = raw2;
       } catch (e) {}
     }
@@ -7239,11 +7268,16 @@ const TOPIMG = "";   /* this PDF carries no image */
 
       const bubble = AIChat.beginAi(card);
       let raw = "";
+      const gopts = {
+        temperature: 0.1,
+        preferGroq: (typeof inkUsed === "function") && inkUsed(card),
+        onDelta: function (t) { raw += t; AIChat.delta(bubble, raw); }
+      };
       try {
-        raw = await aiAskLang(msgs, {
-          temperature: 0.1,
-          onDelta: function (t) { raw += t; AIChat.delta(bubble, raw); }
-        }, /[\u0600-\u06FF]/.test(attempt));
+        raw = await aiAskLang(msgs, gopts, /[\u0600-\u06FF]/.test(attempt));
+        try {
+          if (d.ink && d.ink.reportRoute) d.ink.reportRoute(gopts.routed || "google");
+        } catch (e) {}
       } catch (e) {
         AIChat.fail(bubble, e);
         d.aiBusy = false;
@@ -7784,6 +7818,766 @@ const TOPIMG = "";   /* this PDF carries no image */
   window.AITutor = AITutor;
   window.AISearch = AISearch;
   window.AISet = AISet;
+
+  /* ================= 7.5 · THE PEN (ported) ================= */
+  /* =======================================================================
+     7.5 · THE PEN  ·  write the answer with a stylus (or a finger, or a mouse)
+     -------------------------------------------------------------------------
+     A pad under every written answer: he writes the answer by hand, the same
+     online AI that reads typed answers reads the picture, puts HIS OWN words
+     into the box, and the usual "check my answer" marks them.
+
+     · the ink lives on the device (localStorage) - it is still there tomorrow,
+       on the same browser, and it is only ever sent as the one picture he asked
+       to be read;
+     · the transcription never carries the secret rubric or the ideal answer:
+       the reader is told to transcribe, never to answer;
+     · pressure + tilt-free smooth ink, palm rejection, undo / redo, three inks,
+       three nibs, and a full-page mode for a tablet;
+     · nothing here touches the reference design: the toggle, the box, the small
+       buttons and the big buttons are the page's own .qimgbtn / .qimgbox /
+       .mini / .btn classes, and the extra CSS is a style block of its own.
+     ======================================================================= */
+  const INK_LIMIT_TXT = [
+    "\ud83d\udc53 \u0627\u0644\u0642\u0644\u0645 \u0628\u064a\u0642\u0631\u0623 \u0628\u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0648\u062d\u062f\u0647 \u2014 \u0647\u0648 \u0627\u0644\u0644\u064a \u0628\u064a\u0634\u0648\u0641 \u0627\u0644\u0635\u0648\u0631\u0629",
+    "- \u270d\ufe0f \u0643\u062a\u0627\u0628\u062a\u0643 \u0645\u0634 \u0636\u0627\u064a\u0639\u0629: \u0645\u062d\u0641\u0648\u0638\u0629 \u0639\u0644\u0649 \u0627\u0644\u0628\u0627\u062f\u060c \u0648\u0627\u0643\u062a\u0628\u0647\u0627 \u0641\u064a \u0627\u0644\u0635\u0646\u062f\u0648\u0642 \u0644\u0648 \u062a\u062d\u0628 \u062a\u0635\u062d\u0651\u062d \u062d\u0627\u0644\u0627\u064b",
+    "- \u2699 \u062e\u0644\u0651\u064a \u0645\u0639\u0627\u0643 \u0645\u0641\u062a\u0627\u062d Groq \u0645\u062c\u0627\u0646\u064a: \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0648\u0627\u0644\u0634\u0627\u062a \u0648\u0627\u0644\u0628\u062d\u062b \u0628\u064a\u062f\u0648\u0651\u0631\u0648\u0627 \u0639\u0644\u064a\u0647 \u0644\u0648\u062d\u062f\u0647\u0645",
+    "- \u2328\ufe0f \u0644\u0644\u0643\u062a\u0627\u0628\u0629 \u0627\u0644\u0639\u0627\u062f\u064a\u0629 \u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0643\u0641\u0627\u064a\u0629 \u062e\u0627\u0644\u0635 \u270c \u00b7 \u0648\u0627\u0633\u062a\u0646\u0649 \u0634\u0648\u064a\u0629 \u0648\u0645\u062a\u0627\u062d \u0627\u0644\u0642\u0644\u0645 \u064a\u0631\u062c\u0639",
+  ].join("\n");
+  const INK_STORE = "mep.ink.sq.v1";
+  const INK_PREF = "mep.ink.sq.pref.v1";
+  const INK_INKS = [{ c: "#123a6b", n: "blue" }, { c: "#17202b", n: "black" }, { c: "#b3261e", n: "red" }];
+  const INK_NIBS = [1.7, 2.7, 4.2];
+  const INK_LINE = 34;
+  let inkMem = null, inkPref = null, inkCssOn = false, inkBusy = {};
+
+  function inkLoad() {
+    if (inkMem) return inkMem;
+    try { inkMem = JSON.parse(localStorage.getItem(INK_STORE)) || {}; } catch (e) { inkMem = {}; }
+    return inkMem;
+  }
+  function inkPut(key, rec) {
+    const m = inkLoad();
+    if (!rec || !rec.s || !rec.s.length) { if (m[key]) { delete m[key]; try { localStorage.setItem(INK_STORE, JSON.stringify(m)); } catch (e) {} } return true; }
+    m[key] = rec;
+    try { localStorage.setItem(INK_STORE, JSON.stringify(m)); return true; } catch (e) { return false; }
+  }
+  function inkGet(key) { return inkLoad()[key] || null; }
+  function inkPrefGet() {
+    if (inkPref) return inkPref;
+    try { inkPref = JSON.parse(localStorage.getItem(INK_PREF)) || {}; } catch (e) { inkPref = {}; }
+    if (!inkPref) inkPref = {};
+    return inkPref;
+  }
+  function inkPrefPut(o) {
+    const p = inkPrefGet();
+    for (const k in o) p[k] = o[k];
+    try { localStorage.setItem(INK_PREF, JSON.stringify(p)); } catch (e) {}
+  }
+  function inkPenLikely() {
+    try {
+      if (window.PointerEvent && (navigator.maxTouchPoints || 0) > 0) return true;
+      return /Tablet|Android|iPad|iPhone|Silk/i.test(navigator.userAgent || "");
+    } catch (e) { return false; }
+  }
+
+  /* ---------- the extra CSS (its own block - the reference sheet is untouched) ---------- */
+  function inkCss() {
+    if (inkCssOn) return; inkCssOn = true;
+    const css = [
+      ".ink{margin:12px 0 2px}",
+      ".ink .qimgwrap{display:block;margin-top:2px}",
+      ".ink .qimgbtn{display:inline-flex;align-items:center;gap:7px;font:inherit;font-weight:900;font-size:12px;",
+      "  color:#eaf1fb;background:linear-gradient(180deg,#37536E 0%,#294056 100%);border:1.5px solid rgba(255,210,31,.55);",
+      "  border-radius:999px;padding:7px 13px;cursor:pointer;line-height:1.2}",
+      ".ink .qimgbtn:hover{filter:brightness(1.35) saturate(1.05);box-shadow:0 0 0 3px rgba(255,210,31,.5),0 6px 16px rgba(0,0,0,.24)}",
+      ".ink .qimgbtn:active{filter:brightness(1.6)}",
+      ".ink .qimgbtn .qi{font-size:14px;line-height:1}",
+      ".ink .qimgbtn .qt{font-weight:900}",
+      ".ink .qimgbtn .qs{font-weight:800;font-size:11px;opacity:.72}",
+      ".ink .qimgbtn.open .qs{opacity:0}",
+      ".ink .qimgbox{margin-top:10px;padding:10px;border-radius:14px;background:#fff;border:2px dashed #cdd7ea}",
+      ".ink .qimgbox[hidden]{display:none}",
+      ".ink .qimgbox{background:#fff;border:2px dashed #cdd7ea;padding:9px}",
+      ".ink.open .qimgbox{border-style:solid}",
+      ".inkbar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:0 0 8px}",
+      ".inkbar .spacer{flex:1 1 8px}",
+      ".inkbtn{display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 10px;border:0;border-radius:9px;",
+      "  font:inherit;font-weight:900;font-size:12px;cursor:pointer;color:#fff;",
+      "  background:linear-gradient(180deg,#37536e 0%,#294056 100%);transition:filter .16s,box-shadow .16s;white-space:nowrap}",
+      ".inkbtn:hover{filter:brightness(1.35);box-shadow:0 0 0 2px var(--yellow),0 0 0 5px rgba(255,210,31,.3)}",
+      ".inkbtn:active{filter:brightness(1.6)}",
+      ".inkbtn.ghost{background:#eef1f6;color:#38404a;font-weight:800}",
+      ".inkbtn.ghost:hover{filter:brightness(1.06)}",
+      ".inkbtn.off{opacity:.42;cursor:default;filter:grayscale(.5)}",
+      ".inkbtn[disabled]{opacity:.55;cursor:progress;pointer-events:none}",
+      ".inkbtn.off:hover{filter:grayscale(.5);box-shadow:none}",
+      ".inkdot{width:20px;height:20px;min-width:20px;border-radius:50%;padding:0;",
+      "  box-shadow:inset 0 0 0 2px rgba(255,255,255,.55);border:0;cursor:pointer}",
+      ".inkdot:hover{box-shadow:inset 0 0 0 2px rgba(255,255,255,.8),0 0 0 2px var(--yellow),0 0 0 5px rgba(255,210,31,.3)}",
+      ".inkdot.sel,.inkbtn.sel{box-shadow:inset 0 0 0 2px rgba(255,255,255,.85),0 0 0 2.5px var(--yellow),0 0 0 6px rgba(255,210,31,.3)}",
+      ".inkbtn.sel{background:linear-gradient(180deg,#0f8a3c 0%,#0b6b2f 100%);color:#fff}",
+      ".inkcvwrap{position:relative;border-radius:11px;overflow:hidden;background-color:#fff;",
+      "  background-image:repeating-linear-gradient(180deg,rgba(55,83,110,.16) 0,rgba(55,83,110,.16) 1px,transparent 1px,transparent " + INK_LINE + "px),",
+      "  linear-gradient(90deg,rgba(179,38,30,.20) 0,rgba(179,38,30,.20) 1px,transparent 1px);",
+      "  background-position:0 12px,34px 0}",
+      ".inkcv{display:block;width:100%;height:136px;touch-action:none;cursor:crosshair}",
+      ".inkcv.full{height:100%}",
+      ".ink .qimgbtn.suggest{box-shadow:0 0 0 2.5px var(--yellow),0 0 0 7px rgba(255,210,31,.22),0 4px 14px rgba(0,0,0,.16)}",
+      ".ink .qimgbtn.suggest .qs{opacity:1;color:#7a6300}",
+      ".inkcvwrap.locked{opacity:.92;cursor:default}",
+      ".inkstat{font-size:12px;font-weight:900;color:#37536e;margin-top:8px;unicode-bidi:plaintext}",
+      ".inkstat[data-s=busy]{color:#7a5200}",
+      ".inkstat[data-s=bad]{color:#8f1111}",
+      ".inkstat[data-s=good]{color:#0a5c2a}",
+      ".inknote{font-size:11.5px;font-weight:800;color:#7b8494;margin-top:6px;unicode-bidi:plaintext}",
+      ".inkhint{margin-top:9px;padding:9px 11px;border-radius:11px;font-size:12px;font-weight:800;line-height:1.6;",
+      "  color:#2b3646;background:linear-gradient(180deg,#f8faff,#eef2fb);border:1px solid #cdd7ea;unicode-bidi:plaintext}",
+      ".inkhint b{color:#37536e}",
+      ".inkmode{font-weight:900;color:#37536e}",
+            ".inksethint{margin:2px 0 10px;padding:7px 9px;border-radius:10px;font-size:11.5px;font-weight:800;",
+      "  line-height:1.55;color:#2b3646;background:rgba(55,83,110,.09);border:1px dashed rgba(55,83,110,.4);unicode-bidi:plaintext}",
+      ".inkout{margin-top:8px;font-weight:800;font-size:13.5px;line-height:1.55;color:#16202c;",
+      "  background:#f8faff;border:1px solid #e8edf5;border-radius:11px;padding:9px 11px;unicode-bidi:plaintext;",
+      "  white-space:pre-wrap;word-break:normal}",
+      ".inkout[hidden]{display:none}",
+      ".inkfull{position:fixed;inset:0;z-index:99999;background:rgba(23,32,44,.55);",
+      "  display:flex;align-items:stretch;justify-content:center;padding:10px}",
+      ".inkfull .inkpanel{flex:1 1 auto;display:flex;flex-direction:column;background:#fff;border-radius:16px;",
+      "  border:2.5px solid var(--yellow);padding:10px;box-shadow:0 18px 50px rgba(0,0,0,.35);min-width:0}",
+      ".inkfull .inkcvwrap{flex:1 1 auto;min-height:0}",
+      ".inkfull .inkcv{height:100%;min-height:200px}"
+    ].join("\n");
+    const st = document.createElement("style");
+    st.id = "ink-css"; st.type = "text/css"; st.textContent = css;
+    document.head.appendChild(st);
+  }
+
+  /* ---------- three new sounds, on the page's own synth ---------- */
+  function inkSounds() {
+    if (typeof SOUND === "undefined") return;
+    SOUND.inkOpen = function () {
+      hiss({ d: .2, f0: 300, f1: 1900, v: .07, filter: "bandpass" });
+      tone({ f: 420, f2: 880, d: .16, type: "sine", v: .10 });
+    };
+    SOUND.inkClose = function () {
+      hiss({ d: .16, f0: 1600, f1: 300, v: .055, filter: "bandpass" });
+      tone({ f: 760, f2: 300, d: .15, type: "sine", v: .08 });
+    };
+    SOUND.inkPen = function () {
+      hiss({ d: .035, f0: 1400, f1: 2600, v: .05, filter: "bandpass" });
+    };
+    SOUND.inkUndo = function () { tone({ f: 720, f2: 430, d: .08, type: "triangle", v: .12 }); };
+    SOUND.inkRedo = function () { tone({ f: 430, f2: 720, d: .08, type: "triangle", v: .12 }); };
+    SOUND.inkClear = function () {
+      tone({ f: 300, f2: 110, d: .22, type: "sine", v: .14 });
+      hiss({ d: .16, f0: 900, f1: 200, v: .09 });
+    };
+    SOUND.inkRead = function () {
+      hiss({ d: .3, f0: 320, f1: 3200, v: .08, filter: "bandpass" });
+      tone({ f: 520, f2: 900, d: .22, type: "sine", v: .09 });
+    };
+    SOUND.inkGot = function () { seq([784, 1047, 1319], .075, { d: .22, v: .12, type: "sine" }); };
+    SOUND.inkFull = function () {
+      hiss({ d: .26, f0: 240, f1: 2200, v: .08, filter: "bandpass" });
+      seq([392, 523, 659], .06, { d: .24, v: .11 });
+    };
+  }
+
+  /* the pen's reader goes to GOOGLE only. The OpenAI-shaped body the other
+     two providers use carries text (that is how the page is built), so a
+     picture handed to them would come back INVENTED - and a student would be
+     marked down for handwriting he never wrote. No fallback here, ever. */
+  async function inkAsk(messages, opts) {
+    const k = aiKeys();
+    if (!k.gemini) {
+      const e = aiStop("the pen needs the Google key", "provider");
+      e.inkNoKey = true; throw e;
+    }
+    let models = [];
+    try { models = (await geminiModelList(k.gemini)) || []; } catch (e) {}
+    if (!models.length) models = GEMINI_FALLBACK_MODELS.slice();
+    let lastErr = null, limitErr = null;
+    for (let i = 0; i < models.length; i++) {
+      try {
+        return await geminiOnce(models[i], messages, opts, k.gemini);
+      } catch (e) {
+        lastErr = lastErr || e;
+        if (aiLooksLimited(e)) { limitErr = e; break; }   /* the amount is spent - no point walking the list */
+      }
+    }
+    const err = limitErr || lastErr || new Error("no google model answered");
+    if (limitErr) err.inkLimit = true;
+    throw err;
+  }
+
+  /* is this card a PEN answer? ink on the pad now, or ink kept for it before */
+  function inkUsed(card) {
+    try {
+      const d = card && card._d;
+      if (!d) return false;
+      if (d.inkSaid) return true;
+      if (d.ink && d.ink.s && d.ink.s.length) return true;
+      const p = d.key ? inkGet(d.key) : null;
+      return !!(p && p.s && p.s.length);
+    } catch (e) { return false; }
+  }
+  /* the line that tells him, in his own language, where each job runs */
+  function inkModeLine() {
+    const k = aiKeys();
+    if (!k.gemini) return "\u26a0\ufe0f \u0645\u0646 \u063a\u064a\u0631 \u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0627\u0644\u0642\u0644\u0645 \u0645\u0628\u064a\u0642\u062f\u0631\u0634 \u064a\u0642\u0631\u0623 \u2014 \u0636\u064a\u0641\u0647 \u0627\u0644\u0645\u062c\u0627\u0646\u064a \u0645\u0646 \u2699";
+    if (k.groq) return "\u2705 \u0627\u0644\u0642\u0631\u0627\u0621\u0629 \u0639\u0644\u0649 \u062c\u0648\u062c\u0644 \u00b7 \u0648\u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0639\u0644\u0649 Groq \u2014 \u0643\u062f\u0647 \u0645\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0628\u064a\u0643\u0641\u064a \u0642\u0644\u0645 \u0623\u0643\u062a\u0631";
+    return "\u2139\ufe0f \u0645\u0641\u062a\u0627\u062d\u0643 \u0627\u0644\u0648\u0627\u062d\u062f \u0628\u064a\u0642\u0631\u0623 \u0648\u0628\u064a\u0635\u062d\u062d \u0639\u0644\u0649 \u062c\u0648\u062c\u0644 \u00b7 \u0644\u0648 \u0636\u0641\u062a Groq \u0645\u0646 \u2699 \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0647\u064a\u0645\u0634\u064a \u0639\u0644\u064a\u0647 \u0648\u064a\u0633\u064a\u0628 \u062c\u0648\u062c\u0644 \u0644\u0644\u0642\u0644\u0645 \u0628\u0633";
+  }
+
+  /* ---------- the pad itself ---------- */
+  function InkPad(card) {
+    const d = card._d, q = d.q, key = d.key || q.key || q.n;
+    let ta = q1(".wta", d.wrow), row = d.wrow, vb = q1(".wv", row);
+    const pref = inkPrefGet();
+    const self = this;
+    this.card = card; this.key = key; this.ta = ta; this.row = row;
+    this.s = inkGet(key) && Array.isArray(inkGet(key).s) ? inkGet(key).s.slice() : [];
+    this.undone = [];
+    this.ink = (pref.ink >= 0 && INK_INKS[pref.ink]) ? pref.ink : 0;
+    this.nib = (pref.nib >= 0 && pref.nib < INK_NIBS.length) ? pref.nib : 1;
+    this.penOnly = !!pref.penOnly;
+    this.busy = false;
+
+    /* the wrapper + the same toggle button the pictures use */
+    const wrap = document.createElement("div");
+    wrap.className = "qimgwrap ink";
+    const tog = document.createElement("button");
+    tog.type = "button"; tog.className = "qimgbtn";
+    tog.innerHTML = "<span class='qi'>\u270d\ufe0f</span><span class='qt'>with your pen</span>" +
+      "<span class='qs'>write it by hand \u00b7 the AI reads it</span>";
+    const box = document.createElement("div"); box.className = "qimgbox"; box.hidden = true;
+    wrap.appendChild(tog); wrap.appendChild(box);
+
+    const bar = document.createElement("div"); bar.className = "inkbar";
+    function bt(cls, txt, t) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "inkbtn " + cls; b.textContent = txt;
+      if (t) b.title = t;
+      bar.appendChild(b); return b;
+    }
+    this.bInk = bt("ghost inkdot", "");
+    this.bInk.style.background = INK_INKS[this.ink].c;
+    this.bInk.title = "the ink \u2014 tap to change it (now " + INK_INKS[this.ink].n + ")";
+    this.bNib = bt("ghost", "\u25cf", "the nib: fine \u00b7 medium \u00b7 bold");
+    this.bUndo = bt("ghost", "\u21b6", "undo one stroke");
+    this.bRedo = bt("ghost", "\u21b7", "bring it back");
+    this.bClear = bt("ghost", "\u00d7 clear", "clear the pad (undo brings it back)");
+    this.bHand = bt("ghost", "\u270b hand", "ignore the palm of your hand (pen and mouse only)");
+    this.bFull = bt("ghost", "\u2922 full page", "write big on the whole screen");
+    const sp = document.createElement("span"); sp.className = "spacer"; bar.appendChild(sp);
+    this.bRead = bt("", "\ud83d\udc53 read my writing", "the AI turns your pen into words in the box above");
+    this.bBoth = bt("", "\ud83e\udd16 read it + check", "read the pen and send it to the AI tutor at once");
+    box.appendChild(bar);
+
+    const cvwrap = document.createElement("div"); cvwrap.className = "inkcvwrap";
+    const cv = document.createElement("canvas"); cv.className = "inkcv";
+    cv.setAttribute("aria-label", "write your answer here with a pen, a finger or the mouse");
+    cvwrap.appendChild(cv); box.appendChild(cvwrap);
+    this.cv = cv; this.cvwrap = cvwrap;
+
+    this.stat = document.createElement("div"); this.stat.className = "inkstat";
+    this.stat.setAttribute("role", "status");
+    this.out = document.createElement("div"); this.out.className = "inkout"; this.out.hidden = true;
+    const note = document.createElement("div"); note.className = "inknote";
+    note.textContent = "\u270d\ufe0f \u0643\u062a\u0627\u0628\u062a\u0643 \u0639\u0644\u0649 \u0627\u0644\u0628\u0627\u062f \u0628\u062a\u062a\u062d\u0641\u0638 \u0639\u0644\u0649 \u0627\u0644\u062c\u0647\u0627\u0632 \u0628\u0633 \u00b7 \u0627\u0643\u062a\u0628 \u0628\u0627\u0644\u0642\u0644\u0645 \u0623\u0648 \u0628\u0627\u0644\u0635\u0648\u0628\u0627\u0639 \u0623\u0648 \u0628\u0627\u0644\u0645\u0627\u0648\u0633";
+    const hint = document.createElement("div"); hint.className = "inkhint";
+    hint.innerHTML = "\ud83d\udc53 \u0627\u0644\u0642\u0644\u0645 \u0628\u064a\u0642\u0631\u0623 \u0628\u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0648\u062d\u062f\u0647 \u2014 \u0647\u0648 \u0627\u0644\u0644\u064a \u0628\u064a\u0634\u0648\u0641 \u0627\u0644\u0635\u0648\u0631\u0629\u060c \u0648\u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u062a\u0633\u062a\u0647\u0644\u0643 \u0627\u0644\u0645\u062a\u0627\u062d \u0627\u0644\u0645\u062c\u0627\u0646\u064a \u0623\u0633\u0631\u0639 \u0628\u0643\u062a\u064a\u0631 \u0645\u0646 \u0627\u0644\u0643\u0644\u0627\u0645 \u00b7 \u0627\u0644\u0642\u0631\u0627\u0621\u0629 \u0648\u0627\u0644\u0625\u062c\u0627\u0628\u0629 \u0628\u0627\u0644\u0625\u0646\u062c\u0644\u064a\u0632\u064a \u270d" +
+      "<br>" + "<span class='inkmode'>" + inkModeLine() + "</span>";
+    box.appendChild(this.stat); box.appendChild(this.out); box.appendChild(hint); box.appendChild(note);
+
+    const ctx = cv.getContext ? cv.getContext("2d") : null;
+    this.ctx = ctx;
+    this.unsupported = !ctx;
+    if (this.unsupported) {
+      this.stat.dataset.s = "bad";
+      this.stat.textContent = "\ud83d\ude15 this browser will not open a drawing pad \u2014 type your answer instead, everything else on the page works";
+      [this.bRead, this.bBoth, this.bClear, this.bUndo, this.bRedo].forEach(function (b) { b.classList.add("off"); });
+    }
+    row.insertBefore(wrap, vb || null);
+    this.wrap = wrap;
+    this.tog = tog;
+
+    /* the written row can be rebuilt under the pad (a re-render, the filter) or the pad can
+       be sitting in the full-page overlay: bind() re-points it at the live row and puts it
+       back - it must never be built a second time for the same card */
+    this.bind = function () {
+      const dd = self.card && self.card._d;
+      if (!dd) return self;
+      if (dd.wrow && dd.wrow !== row) {
+        row = dd.wrow; self.row = row;
+        const t2 = q1(".wta", row); if (t2) { ta = t2; self.ta = t2; }
+        vb = q1(".wv", row);
+      }
+      if (row && wrap.parentNode !== row && !self.full) {
+        try { row.insertBefore(wrap, vb || null); } catch (e) {}
+      }
+      return self;
+    };
+
+    /* open / close: a pad opens by itself only when it still holds HIS ink -
+       on a phone every card would otherwise build an open canvas (85 of them = 92 MB) */
+    const open0 = self.s.length > 0;
+    this.setOpen = function (on, silent) {
+      box.hidden = !on;
+      wrap.classList.toggle("open", on);
+      tog.classList.toggle("open", on);
+      q1(".qt", tog).textContent = on ? "hide the pen" : "with your pen";
+      q1(".qs", tog).textContent = on ? "" : "write it by hand \u00b7 the AI reads it";
+      if (on) tog.classList.remove("suggest");
+      if (on) {
+        if (self.fit) self.fit();                       /* the very first open runs inside the constructor */
+        inkSounds(); inkFirstTip();
+        try { requestAnimationFrame(function () { if (self.fit) self.fit(); }); } catch (e) {}
+      }
+      if (!silent) sfx(on ? "inkOpen" : "inkClose");
+      if (on && !silent && typeof FX !== "undefined" && FX.stars) {
+        const r = tog.getBoundingClientRect(); FX.stars(r.left + 22, r.top + 8, 5);
+      }
+    };
+    tog.addEventListener("click", function () { self.setOpen(!!box.hidden); });
+    if (open0) this.setOpen(true, true);
+    else if (inkPenLikely()) tog.classList.add("suggest");
+
+    /* geometry */
+    this.fit = function () {
+      if (self.unsupported) return;
+      const dpr = Math.min(self.full ? 3 : 2, Math.max(1, window.devicePixelRatio || 1));
+      const w = Math.max(120, cv.clientWidth || 320), h = Math.max(60, cv.clientHeight || 136);
+      cv._cssw = w; cv._cssh = h;
+      const W = Math.round(w * dpr), H = Math.round(h * dpr);
+      if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+      self.dpr = dpr;
+      if (self.redraw) self.redraw();
+    };
+
+    this.redraw = function () {
+      if (self.unsupported) return;
+      const g = self.ctx, W = self.cv.width, H = self.cv.height, k = self.dpr || 1;
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.clearRect(0, 0, W, H);
+      g.lineCap = "round"; g.lineJoin = "round";
+      const all = self.cur ? self.s.concat([self.cur]) : self.s;
+      for (let i = 0; i < all.length; i++) inkStroke(g, all[i], k, cv._cssw, cv._cssh);
+      if (self.sync) self.sync();
+    };
+    this.sync = function () {
+      const n = self.s.length;
+      if (self.paintMode) self.paintMode();
+      self.bUndo.classList.toggle("off", !n);
+      self.bRedo.classList.toggle("off", !self.undone.length);
+      self.bClear.classList.toggle("off", !n);
+      self.tog.classList.toggle("hasink", n > 0);
+      const wq = q1(".qs", self.tog);
+      if (wq && !box.hidden) wq.textContent = n ? (n + " stroke" + (n > 1 ? "s" : "") + " on the pad") : "";
+      self.bNib.textContent = ["\u25cf", "\u25cf\u25cf", "\u25cf\u25cf\u25cf"][self.nib] || "\u25cf";
+      self.bInk.style.background = INK_INKS[self.ink].c;
+      self.bInk.title = "the ink \u2014 tap to change it (now " + INK_INKS[self.ink].n + ")";
+      self.bHand.classList.toggle("sel", self.penOnly);
+      self.bHand.textContent = self.penOnly ? "\u270d pen only" : "\u270b hand";
+      self.bHand.title = self.penOnly ? "the palm is ignored \u2014 tap to let the finger write too"
+        : "ignore the palm of your hand (pen and mouse only)";
+      self.bRead.disabled = self.busy; self.bBoth.disabled = self.busy;
+    };
+    /* where the correction actually ran - told to him in Arabic */
+    this.paintMode = function () {
+      const md = q1(".inkmode", self.wrap);
+      if (!md) return;
+      md.innerHTML = self.route === "groq" ? "\u2705 \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0645\u0634\u064a \u0639\u0644\u0649 Groq \u00b7 \u062c\u0648\u062c\u0644 \u0627\u062a\u0633\u064a\u0628 \u0644\u0644\u0642\u0644\u0645 \u270c"
+        : self.route === "groq-out" ? "\u23f3 \u0645\u062a\u0627\u062d Groq \u062e\u0644\u0635 \u2014 \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0631\u062c\u0639 \u0639\u0644\u0649 \u062c\u0648\u062c\u0644"
+        : self.route === "google" ? (aiKeys().groq ? "\u2139\ufe0f \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u062f\u0647 \u0645\u0634\u064a \u0639\u0644\u0649 \u062c\u0648\u062c\u0644 \u0627\u0644\u0645\u0631\u0629 \u062f\u064a \u00b7 \u0648\u0627\u0644\u0642\u0644\u0645 \u0644\u0633\u0647 \u0639\u0644\u0649 \u062c\u0648\u062c\u0644"
+          : "\u2139\ufe0f \u0645\u0641\u062a\u0627\u062d\u0643 \u0627\u0644\u0648\u0627\u062d\u062f \u0628\u064a\u0642\u0631\u0623 \u0648\u0628\u064a\u0635\u062d\u062d \u0639\u0644\u0649 \u062c\u0648\u062c\u0644 \u00b7 \u0644\u0648 \u0636\u0641\u062a Groq \u0645\u0646 \u2699 \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0647\u064a\u0645\u0634\u064a \u0639\u0644\u064a\u0647 \u0648\u064a\u0633\u064a\u0628 \u062c\u0648\u062c\u0644 \u0644\u0644\u0642\u0644\u0645 \u0628\u0633")
+        : inkModeLine();
+    };
+    this.reportRoute = function (how) { self.route = how; self.paintMode(); };
+
+    this.say = function (t, kind) {
+      self.stat.textContent = t || "";
+      self.stat.dataset.s = kind || "";
+    };
+    this.save = function () {
+      const rec = { s: self.s, w: cv._cssw, h: cv._cssh, i: self.ink, n: self.nib, t: Date.now() };
+      const ok = inkPut(self.key, rec);
+      self.say(ok ? (self.s.length ? "\u270b kept on this device" : "the pad is empty") :
+        "\ud83d\udcbe the pad is full \u2014 the browser will not keep more ink (clear a stroke)", ok ? "" : "bad");
+      if (!ok) self.say("\ud83d\udcbe the browser refused to store the ink \u2014 you can still write and send it", "bad");
+    };
+
+    /* ---------- the pen ---------- */
+    function pt(e) {
+      const r = cv.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top, p: (typeof e.pressure === "number" && e.pressure > 0) ? e.pressure : 0.5 };
+    }
+    function allowed(e) {
+      if (self.penOnly && e.pointerType === "touch") return false;
+      return true;
+    }
+    cv.addEventListener("pointerdown", function (e) {
+      if (self.unsupported) return;
+      if (!allowed(e)) return;
+      if (self.busy) { e.preventDefault(); return; }
+      try { cv.setPointerCapture(e.pointerId); } catch (er) {}
+      if (e.preventDefault) e.preventDefault();
+      const o = pt(e);
+      self.cur = { c: INK_INKS[self.ink].c, w: INK_NIBS[self.nib],
+                   _w: cv._cssw || 0, _h: cv._cssh || 0, p: [[o.x, o.y, o.p]] };
+      self.undone = [];
+      sfx("inkPen");
+      self.redraw();
+    });
+    cv.addEventListener("pointermove", function (e) {
+      if (!self.cur) return;
+      if (!allowed(e)) return;
+      const o = pt(e), p = self.cur.p, n = p.length;
+      if (n) {
+        const dx = o.x - p[n - 1][0], dy = o.y - p[n - 1][1];
+        if (dx * dx + dy * dy < 3.2) return;               /* keep it light and smooth */
+      }
+      p.push([o.x, o.y, o.p]);
+      self.redraw();
+    });
+    function up(e) {
+      if (!self.cur) return;
+      const st = self.cur; self.cur = null;
+      if (st.p.length > 1 || st.p.length === 1) self.s.push(st);
+      try { cv.releasePointerCapture(e.pointerId); } catch (er) {}
+      self.redraw(); self.save();
+    }
+    cv.addEventListener("pointerup", up);
+    cv.addEventListener("pointercancel", function () { self.cur = null; self.redraw(); });
+    if (!window.PointerEvent) {
+      /* no pointer events at all: the mouse writes */
+      cv.addEventListener("mousedown", function (e) {
+        cv.dispatchEvent(new MouseEvent("pointerdown", { clientX: e.clientX, clientY: e.clientY, bubbles: true, cancelable: true }));
+      });
+      cv.addEventListener("mousemove", function (e) {
+        cv.dispatchEvent(new MouseEvent("pointermove", { clientX: e.clientX, clientY: e.clientY, bubbles: true }));
+      });
+      document.addEventListener("mouseup", function (e) {
+        cv.dispatchEvent(new MouseEvent("pointerup", { clientX: e.clientX, clientY: e.clientY, bubbles: true }));
+      });
+    }
+
+    /* ---------- the toolbar ---------- */
+    this.bInk.addEventListener("click", function () {
+      self.ink = (self.ink + 1) % INK_INKS.length;
+      inkPrefPut({ ink: self.ink }); sfx("boxClick"); self.sync();
+      self.say("the ink is " + INK_INKS[self.ink].n + " now");
+    });
+    this.bNib.addEventListener("click", function () {
+      self.nib = (self.nib + 1) % INK_NIBS.length;
+      inkPrefPut({ nib: self.nib }); sfx("select"); self.redraw();
+      self.say("the nib: " + ["fine", "medium", "bold"][self.nib]);
+    });
+    this.bHand.addEventListener("click", function () {
+      self.penOnly = !self.penOnly; inkPrefPut({ penOnly: self.penOnly });
+      sfx("exclude"); self.sync();
+      self.say(self.penOnly ? "\u270b the palm of your hand is ignored now \u2014 the pen and the mouse write"
+        : "\u270d\ufe0f the finger writes too");
+    });
+    this.bUndo.addEventListener("click", function () {
+      if (!self.s.length) { sfx("noResult"); return; }
+      self.undone.push(self.s.pop()); sfx("inkUndo"); self.redraw(); self.save();
+    });
+    this.bRedo.addEventListener("click", function () {
+      if (!self.undone.length) { sfx("noResult"); return; }
+      const g = self.undone.pop();
+      if (Array.isArray(g)) self.s = self.s.concat(g); else self.s.push(g);
+      sfx("inkRedo"); self.redraw(); self.save();
+    });
+    this.bClear.addEventListener("click", function () {
+      if (!self.s.length) { sfx("noResult"); return; }
+      self.undone.push(self.s.slice()); self.s = [];
+      sfx("inkClear"); self.redraw(); self.save();
+      self.say("\u00d7 cleared \u2014 \u21b7 brings it back", "");
+    });
+    this.bFull.addEventListener("click", function () { self.setFull(!self.full); });
+    this.bRead.addEventListener("click", function () { self.read(false); });
+    this.bBoth.addEventListener("click", function () { self.read(true); });
+
+    /* ---------- full page ---------- */
+    this.setFull = function (on) {
+      const parent0 = wrap.parentNode;
+      if (on) {
+        const ov = document.createElement("div"); ov.className = "inkfull";
+        const panel = document.createElement("div"); panel.className = "inkpanel";
+        const head = document.createElement("div"); head.className = "inkbar";
+        const t = document.createElement("b"); t.textContent = "\u270d\ufe0f Q" + q.n + " \u00b7 " + (q.text || "").slice(0, 80);
+        head.style.alignItems = "center"; head.appendChild(t);
+        const sp2 = document.createElement("span"); sp2.className = "spacer"; head.appendChild(sp2);
+        const x = document.createElement("button"); x.type = "button"; x.className = "xbtn"; x.textContent = "\u2715";
+        x.addEventListener("click", function () { self.setFull(false); });
+        head.appendChild(x);
+        panel.appendChild(head);
+        self.savedParent = parent0; self.savedNext = wrap.nextSibling;
+        panel.appendChild(wrap);
+        ov.appendChild(panel);
+        document.body.appendChild(ov);
+        self.ov = ov; self.full = true;
+        cv.classList.add("full");
+        ov.addEventListener("click", function (e) { if (e.target === ov) self.setFull(false); });
+        self._esc = function (e) { if (e.key === "Escape") self.setFull(false); };
+        document.addEventListener("keydown", self._esc);
+        try { document.body.style.overflow = "hidden"; } catch (e) {}
+        sfx("inkFull");
+      } else {
+        if (self.ov) {
+          if (self.savedParent) self.savedParent.insertBefore(wrap, self.savedNext || null);
+          else document.body.appendChild(wrap);
+          try { self.ov.parentNode.removeChild(self.ov); } catch (e) {}
+          self.ov = null;
+        }
+        if (self._esc) { document.removeEventListener("keydown", self._esc); self._esc = null; }
+        self.full = false; cv.classList.remove("full");
+        try { document.body.style.overflow = ""; } catch (e) {}
+        sfx("inkClose");
+      }
+      self.bFull.textContent = self.full ? "\u2921 exit full page" : "\u2922 full page";
+      self.fit();
+    };
+
+    /* ---------- the picture of the ink ---------- */
+    this.image = function () {
+      if (self.unsupported) return "";
+      try {
+        const w = cv._cssw || cv.clientWidth || 320, h = cv._cssh || cv.clientHeight || 136;
+        const sc = Math.min(2, Math.max(1, 1500 / w));
+        const c = document.createElement("canvas");
+        c.width = Math.round(w * sc); c.height = Math.round(h * sc);
+        const g = c.getContext("2d"); if (!g) return "";
+        g.fillStyle = "#ffffff"; g.fillRect(0, 0, c.width, c.height);
+        g.drawImage(cv, 0, 0, c.width, c.height);
+        return c.toDataURL("image/png");
+      } catch (e) { return ""; }
+    };
+
+    /* ---------- read the writing ---------- */
+    this.read = function (thenCheck) {
+      if (self.bind) self.bind();                   /* never transcribe into a detached box */
+      if (self.busy) return;
+      if (!self.s.length) {
+        sfx("noResult");
+        self.say("\u270b the pad is empty \u2014 write the answer with the pen first", "bad");
+        toast("write with your pen on the pad first \u270d");
+        self.setOpen(true);
+        return;
+      }
+      const k = (typeof aiKeys === "function") ? aiKeys() : {};
+      if (!k.gemini) {
+        /* the ink is a picture - and on this page only Google's free key has eyes
+           (the OpenAI-shaped body the other two use carries text only, so a call
+           now would make the model invent what it cannot see) */
+        self.out.hidden = false;
+        self.out.textContent = "\u270d\ufe0f \u0643\u062a\u0627\u0628\u062a\u0643 \u0645\u062d\u0641\u0648\u0638\u0629 \u0639\u0644\u0649 \u0627\u0644\u0628\u0627\u062f \u00b7 \u0627\u0644\u0642\u0644\u0645 \u0645\u062d\u062a\u0627\u062c \u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0627\u0644\u0644\u064a \u0628\u064a\u0634\u0648\u0641 \u0627\u0644\u0635\u0648\u0631\u060c \u0636\u064a\u0641\u0647 \u0645\u0646 \u2699";
+        self.say("\ud83d\udc53 \u0627\u0644\u0642\u0644\u0645 \u0628\u064a\u0642\u0631\u0623 \u0628\u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0644\u062d\u0627\u0644\u0647 \u2014 \u0627\u0641\u062a\u062d \u2699 \u0648\u062d\u0637 \u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0627\u0644\u0645\u062c\u0627\u0646\u064a\u060c \u0648\u0643\u062a\u0627\u0628\u062a\u0643 \u0639\u0644\u0649 \u0627\u0644\u0628\u0627\u062f \u0645\u062d\u0641\u0648\u0638\u0629 \u270c");
+        sfx("noResult");
+        if (typeof AISet === "object" && AISet.open) { try { AISet.open(); } catch (e) {} }
+        return;
+      }
+      const img = self.image();
+      if (!img) {
+        sfx("noResult");
+        self.say("\ud83d\ude15 the pad could not be turned into a picture here \u2014 type the answer instead", "bad");
+        return;
+      }
+      /* English only. It is the one saving that is real here: the picture costs the same
+         either way, so the reply is made as small as it can be - Latin letters, no echoing
+         of Arabic, no translating, no explaining. This exam is answered in English, so
+         nothing the grader needs is lost. */
+      const sys = [
+        "You read the handwriting of a medical student. The picture is the answer HE wrote with a pen.",
+        "Transcribe it. Rules:",
+        "- ENGLISH ONLY: write Latin letters and nothing else (this exam is answered in English),",
+        "- copy his letters exactly \u2014 do not correct a letter, do not answer, do not add facts, do not improve,",
+        "- no bullets, no quotes, no commentary, no translating, no explaining; one line per line of his writing,",
+        "- a word in another language, or one you cannot read: put ? there \u2014 never translate it,",
+        "- if there is no writing at all \u2014 or no picture reached you \u2014 reply with exactly: NOTHING"
+      ].join("\n");
+      self.busy = true; self.sync();
+      self.say("\ud83d\udc40 reading your writing\u2026", "busy");
+      sfx("inkRead");
+      const messages = [{
+        role: "user",
+        content: [
+          { type: "text", text: sys + "\n\nTHE QUESTION (context only \u2014 do NOT answer it, do NOT grade it): " + q.text },
+          { type: "image_url", image_url: { url: img } }
+        ]
+      }];
+      inkAsk(messages, { temperature: 0 }).then(function (raw) {
+        self.busy = false;
+        let t = String(raw || "").replace(/^\u200b+|\u200b+$/g, "").trim();
+        t = t.replace(/^```[a-z]*\s*/i, "").replace(/```\s*$/, "").trim();
+        t = t.replace(/^["'\u201c\u2018]+|["'\u201d\u2019]+$/g, "").trim();
+        /* and if the reader did answer in another language after all, that line is not his
+           answer - keep it off the box, the pad still shows every word he wrote */
+        let dropped = 0;
+        try {
+          const ln = t.split("\n");
+          const kp = ln.filter(function (l) { return /[A-Za-z\u00c0-\u024f0-9]/.test(l); });
+          dropped = ln.length - kp.length;
+          if (kp.length) t = kp.join("\n").trim();
+          else dropped = 0;
+        } catch (e) {}
+        if (!t || /^NOTHING$/i.test(t)) {
+          self.say("\ud83d\udc40 I could not see any writing \u2014 write bigger, or press \u2922 full page and try again", "bad");
+          sfx("noResult");
+          return;
+        }
+        if (/^VERDICT:/i.test(t)) t = t.replace(/^VERDICT:[^\n]*\n?/i, "").trim();
+        self.out.hidden = false;
+        self.out.textContent = "\ud83d\udcdd what you wrote: " + t;
+        if (ta.disabled) {
+          self.say("\ud83d\udd12 the answer box is locked after grading \u2014 here is your writing, and it stays on the pad", "busy");
+          sfx("found");
+          return;
+        }
+        ta.value = t;
+        try { ta.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+        row.dataset.dirty = "1";
+        self.card._d.inkSaid = true;
+        self.say(dropped ? "\u270d\ufe0f \u0627\u0644\u0642\u0631\u0627\u0621\u0629 \u0628\u0627\u0644\u0625\u0646\u062c\u0644\u064a\u0632\u064a \u0628\u0633 \u00b7 \u0623\u064a \u0633\u0637\u0631 \u0628\u0627\u0644\u0639\u0631\u0628\u064a \u0633\u0627\u0628 \u0628\u0631\u0627 \u0627\u0644\u062e\u0627\u0646\u0629 \u00b7 \u0643\u062a\u0627\u0628\u062a\u0643 \u0639\u0644\u0649 \u0627\u0644\u0628\u0627\u062f \u0643\u0627\u0645\u0644\u0629 \u270c" :
+          "\u2728 your words are in the box \u2014 fix anything I mis-read, then check it", "good");
+        self.sync();
+        sfx("inkGot");
+        toast("\u270d\ufe0f your writing is in the answer box \u2728");
+        if (thenCheck && typeof gradeWriteCard === "function") { ta.focus(); gradeWriteCard(card); }
+      }).catch(function (e) {
+        self.busy = false; self.sync();
+        const lim = e && (e.inkLimit || e.inkNoKey);
+        const txt = lim ? INK_LIMIT_TXT : (typeof aiFailText === "function" ? aiFailText(e) :
+          "\u26a0\ufe0f the AI did not answer \u2014 open \u2699 and check the key");
+        self.out.hidden = false;
+        self.out.innerHTML = aiMd ? aiMd(txt) : esc(txt);
+        self.say(lim ? "\ud83d\udc53 \u0627\u0644\u0642\u0644\u0645 \u0648\u0642\u0641: \u0645\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u062e\u0644\u0635 \u2014 \u0643\u062a\u0627\u0628\u062a\u0643 \u0645\u062d\u0641\u0648\u0638\u0629 \u0639\u0644\u0649 \u0627\u0644\u0628\u0627\u062f \u00b7 \u0627\u0644\u0634\u0631\u062d \u062a\u062d\u062a" : "\ud83d\udc53 the reading did not go through \u2014 the pad still holds your writing, and you can type it in the box", "bad");
+        sfx("noResult");
+      });
+    };
+
+    window.addEventListener("resize", function () { if (!box.hidden) self.fit(); });
+    if (!box.hidden || self.s.length) self.fit();       /* sized even when it opened straight away */
+    this.sync();
+  }
+
+  /* draw one stroke; the stored points are CSS pixels of the frame he wrote
+     them on, so each stroke is rescaled onto the live canvas of its own accord */
+  function inkStroke(g, st, k, cssW, cssH) {
+    const pts = st.p || [];
+    if (!pts.length) return;
+    const sx = (st._w && cssW && Math.abs(st._w - cssW) > 1) ? (cssW / st._w) : 1;
+    const sy = (st._h && cssH && Math.abs(st._h - cssH) > 1) ? (cssH / st._h) : 1;
+    g.strokeStyle = st.c || "#123a6b";
+    const nib = (st.w || 2.7) * k * sx;
+    if (pts.length === 1) {
+      g.fillStyle = st.c || "#123a6b";
+      g.beginPath(); g.arc(pts[0][0] * k * sx, pts[0][1] * k * sy, Math.max(0.7, nib * 0.55), 0, 6.284); g.fill();
+      return;
+    }
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      const pr = 0.5 + 0.85 * (((a[2] || 0.5) + (b[2] || 0.5)) / 2);
+      g.lineWidth = Math.max(0.7, nib * pr);
+      g.beginPath();
+      g.moveTo(a[0] * k * sx, a[1] * k * sy);
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      g.quadraticCurveTo(a[0] * k * sx, a[1] * k * sy, mx * k * sx, my * k * sy);
+      g.lineTo(b[0] * k * sx, b[1] * k * sy);
+      g.stroke();
+    }
+  }
+
+  /* ---------- put a pad under every written card (the renderer stays untouched) ---------- */
+  function inkAttach(card) {
+    if (!card || !card._d) return;
+    const d = card._d;
+    if (d.ink === null) return;                     /* it was tried and could not be built - leave it */
+    if (d.ink) { try { d.ink.bind(); } catch (e) {} return; }   /* ONE pad per card, wherever the DOM moved it */
+    if (!d.wrow || !d.q || !q1(".wta", d.wrow)) return;
+    if (q1(":scope > .ink", d.wrow)) return;
+    try { d.ink = new InkPad(card); } catch (e) {
+      /* the pad is a bonus: never break the card - and never leave a broken one on it */
+      d.ink = null;
+      try { const w = q1(":scope > .ink", d.wrow); if (w) w.parentNode.removeChild(w); } catch (er) {}
+      try { console.warn("[ink] the pad could not be built here:", (e && e.message) || e); } catch (er) {}
+    }
+  }
+  function inkScan(root) {
+    qall(".card", root || document).forEach(inkAttach);
+  }
+  function inkSetHint() {
+    try {
+      const g = document.getElementById("aisetgroq");
+      if (!g || document.getElementById("inksethint")) return;
+      const row = g.nextElementSibling || g;
+      const d = document.createElement("div");
+      d.id = "inksethint"; d.className = "inksethint";
+      d.innerHTML = "\u270d\ufe0f \u0642\u0631\u0627\u0621\u0629 \u0627\u0644\u0642\u0644\u0645 \u0628\u062a\u062a\u0645 \u0639\u0644\u0649 \u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0644\u062d\u0627\u0644\u0647 \u2014 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u062a\u0633\u062a\u0647\u0644\u0643 \u0627\u0644\u0645\u062a\u0627\u062d \u0623\u0633\u0631\u0639 \u0645\u0646 \u0627\u0644\u0643\u062a\u0627\u0628\u0629\u060c \u0641\u062e\u0644\u064a \u0627\u0644\u0645\u0641\u062a\u0627\u062d \u062f\u0647 \u0627\u062d\u062a\u064a\u0627\u0637\u064a: \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0648\u0627\u0644\u0634\u0627\u062a \u0648\u0627\u0644\u0628\u062d\u062b \u0628\u064a\u062f\u0648\u0651\u0631\u0648\u0627 \u0639\u0644\u0649 Groq \u0644\u0648 \u0645\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u062e\u0644\u0635. \u0648\u0644\u0648 \u0647\u062a\u062c\u0627\u0648\u0628 \u0628\u0627\u0644\u0643\u062a\u0627\u0628\u0629\u060c \u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0644\u062d\u0627\u0644\u0647 \u0643\u0627\u0641\u064a \u270c";
+      row.parentNode.insertBefore(d, row.nextSibling);
+    } catch (e) {}
+  }
+  let inkTip = 0;
+  function inkFirstTip() {
+    if (inkTip) return; inkTip = 1;
+    let seen = null;
+    try { seen = localStorage.getItem("mep.ink.sq.tip"); } catch (e) {}
+    if (seen) return;
+    try { localStorage.setItem("mep.ink.sq.tip", "1"); } catch (e) {}
+    toast("\u270d\ufe0f \u0627\u0644\u0642\u0644\u0645 \u0628\u064a\u0642\u0631\u0623 \u0628\u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0644\u062d\u0627\u0644\u0647 \u2014 \u0644\u0648 \u0645\u062a\u0627\u062d\u0647 \u062e\u0644\u0635\u060c \u0627\u0644\u062a\u0635\u062d\u064a\u062d \u0648\u0627\u0644\u0634\u0627\u062a \u0648\u0627\u0644\u0628\u062d\u062b \u064a\u0641\u0636\u0644\u0648\u0627 \u0634\u063a\u0627\u0644\u064a\u0646 \u0639\u0644\u0649 \u0645\u0641\u062a\u0627\u062d Groq \u0645\u0646 \u2699 \u00b7 \u0648\u0644\u0648 \u0647\u062a\u062c\u0627\u0648\u0628 \u0628\u0627\u0644\u0643\u062a\u0627\u0628\u0629 \u0641\u0645\u0641\u062a\u0627\u062d \u062c\u0648\u062c\u0644 \u0643\u0641\u0627\u064a\u0629 \u270c");
+  }
+
+  function inkInit() {
+    inkCss(); inkSounds(); inkScan(); inkSetHint();
+    /* every card built from now on gets its pad (the row factory is the one place they all pass) */
+    try {
+      if (typeof window.writeRow === "function" && !window.writeRow.__ink) {
+        const orig = window.writeRow;
+        window.writeRow = function (q, card, d) {
+          const row = orig(q, card, d);
+          try { inkAttach(card); } catch (e) {}
+          return row;
+        };
+        window.writeRow.__ink = 1;
+      }
+    } catch (e) {}
+    /* the reset wipes the typed answers - it wipes the ink with them */
+    try {
+      if (typeof window.clearWr === "function" && !window.clearWr.__ink) {
+        const oc = window.clearWr;
+        window.clearWr = function () {
+          inkMem = {};
+          try { localStorage.removeItem(INK_STORE); } catch (e) {}
+          qall(".card").forEach(function (c) { if (c._d && c._d.ink) { c._d.ink.s = []; c._d.ink.undone = []; c._d.ink.redraw(); c._d.ink.setOpen(false, true); } });
+          return oc.apply(this, arguments);
+        };
+        window.clearWr.__ink = 1;
+      }
+    } catch (e) {}
+    /* the filter rebuilds the cards: catch any row that appears without a pad */
+    let raf = 0;
+    try {
+      new MutationObserver(function () {
+        if (raf) return;
+        raf = requestAnimationFrame(function () { raf = 0; inkScan(); });
+      }).observe(document.getElementById("page") || document.body, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+
+  const AIInk = {
+    init: inkInit,
+    /* open the pad of a card and read what is on it */
+    pad: function (card) { return card && card._d ? card._d.ink : null; },
+    open: function (card, on) { const p = this.pad(card); if (p) p.setOpen(on !== false); return p; },
+    read: function (card, thenCheck) { const p = this.pad(card); if (p) p.read(!!thenCheck); return p; },
+    strokes: function (card) { const p = this.pad(card); return p ? p.s : []; },
+    store: INK_STORE
+  };
+  window.AIInk = AIInk;
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", inkInit);
+  else inkInit();
 
   document.addEventListener("DOMContentLoaded", function () {
     AITutor.init();
@@ -9675,4 +10469,4 @@ document.getElementById("modelbtn").addEventListener("click", () => {
   setModel(MODEL === "ai" ? "file" : "ai");
 });
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4016d7cfa41da31',t:'MTc5MDI0OTExOA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a407ba00eb06e189',t:'MTc5MDMxNTE2Ng=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a40d69e52a623d70',t:'MTc5MDM3NDgwMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body></html>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4016d7cfa41da31',t:'MTc5MDI0OTExOA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a407ba00eb06e189',t:'MTc5MDMxNTE2Ng=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a40d69e52a623d70',t:'MTc5MDM3NDgwMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4106e436c242ace',t:'MTc5MDQwNjQzNg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body></html>
